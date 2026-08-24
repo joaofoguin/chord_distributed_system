@@ -74,6 +74,9 @@ async function handleNodeRequest(node, request, response) {
       node.predecessor = normalizeReference((await readJson(request)).node);
       return json(response, 200, { ok: true });
     }
+    if (request.method === 'GET' && url.pathname === '/rpc/successor') {
+      return json(response, 200, { node: node.successor });
+    }
     if (request.method === 'PUT' && url.pathname === '/rpc/successor') {
       node.successor = normalizeReference((await readJson(request)).node);
       return json(response, 200, { ok: true });

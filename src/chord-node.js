@@ -8,7 +8,8 @@ const CATALOG_NAME = 'catalogo.txt';
 const REPLICATION_FACTOR = 5;
 
 class ChordNode {
-  constructor({ id, host = '127.0.0.1', port = 5000, requestTimeout = 10000,
+  constructor({ id, host = '127.0.0.1', port = 5000,
+    requestTimeout = Number(process.env.CHORD_REQUEST_TIMEOUT) || 30000,
     storageDirectory } = {}) {
     this.id = validateId(id);
     this.host = String(host || '').trim();
@@ -210,8 +211,9 @@ class ChordNode {
       visited.add(current.id);
       replicas.push(current);
 
-      const result = await this.rpc(current, '/rpc/successor');
-      current = result.node;
+      current = current.id === this.id
+        ? this.successor
+        : (await this.rpc(current, '/rpc/successor')).node;
     }
 
     return {
