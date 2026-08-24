@@ -13,16 +13,9 @@
       <span class="brand-mark">C</span>
       <span>Chord <small>node console</small></span>
     </a>
-
-    <div class="topbar-actions">
-      <a class="button secondary back-button" href="/">
-        ← Painel inicial
-      </a>
-
-      <div class="connection">
-        <span id="connection-dot" class="dot"></span>
-        <span id="connection-label">Conectando…</span>
-      </div>
+    <div class="connection">
+      <span id="connection-dot" class="dot"></span>
+      <span id="connection-label">Conectando…</span>
     </div>
   </header>
 
@@ -58,13 +51,6 @@
         <span class="stat-label">Finger entries</span>
         <strong>5</strong>
         <span class="stat-detail">m = log₂(32)</span>
-      </article>
-      <article class="stat-card">
-        <span class="stat-label">Successor List</span>
-        <strong id="successor-count">0</strong>
-        <span class="stat-detail">
-          sucessores usados na replicação
-        </span>
       </article>
     </section>
 
@@ -120,67 +106,6 @@
             <tbody id="finger-body"></tbody>
           </table>
         </div>
-      </section>
-
-      <section class="panel successor-panel">
-
-        <div class="panel-heading">
-          <div>
-            <p class="eyebrow">Replicação</p>
-
-            <h2>Successor List</h2>
-
-            <p class="muted">
-              Os sucessores imediatos utilizados para manter as
-              cópias dos arquivos.
-            </p>
-          </div>
-
-          <span class="replication-factor">
-            5 cópias
-          </span>
-        </div>
-
-        <div class="replication-chain">
-
-          <div class="replication-node owner">
-            <span class="replication-role">
-              OWNER
-            </span>
-
-            <strong id="replication-owner">
-              —
-            </strong>
-          </div>
-
-          <span class="replication-arrow">→</span>
-
-          <div id="replication-list" class="replication-list">
-            <span class="empty-row">
-              Aguardando dados…
-            </span>
-          </div>
-
-        </div>
-
-        <div class="table-wrap">
-
-          <table>
-
-            <thead>
-              <tr>
-                <th>Posição</th>
-                <th>Peer</th>
-                <th>Endereço</th>
-              </tr>
-            </thead>
-
-            <tbody id="successor-body"></tbody>
-
-          </table>
-
-        </div>
-
       </section>
     </div>
 

@@ -28,12 +28,7 @@ const elements = {
   uploadFile: document.querySelector('#upload-file'),
   selectedFile: document.querySelector('#selected-file'),
   uploadButton: document.querySelector('#upload-button'),
-  uploadMessage: document.querySelector('#upload-message'),
-  successorCount: document.querySelector('#successor-count'),
-  successorBody: document.querySelector('#successor-body'),
-
-  replicationOwner: document.querySelector('#replication-owner'),
-  replicationList: document.querySelector('#replication-list'),
+  uploadMessage: document.querySelector('#upload-message')
 };
 
 let refreshing = false;
@@ -91,72 +86,6 @@ function renderTable(fingers) {
   }));
 }
 
-function renderSuccessorList(state) {
-  const successors = Array.isArray(state.successorList)
-    ? state.successorList
-    : [];
-
-  elements.successorCount.textContent = successors.length;
-
-  elements.successorBody.replaceChildren();
-
-  successors.forEach((node, index) => {
-    const row = document.createElement('tr');
-
-    const position = document.createElement('td');
-    position.textContent = `S${index + 1}`;
-
-    const peer = document.createElement('td');
-
-    const badge = document.createElement('span');
-    badge.className = 'node-badge';
-    badge.textContent = node.id;
-
-    peer.appendChild(badge);
-
-    const addressCell = document.createElement('td');
-    addressCell.textContent = address(node);
-
-    row.append(
-      position,
-      peer,
-      addressCell
-    );
-
-    elements.successorBody.appendChild(row);
-  });
-
-  /*
-   * Owner + quatro sucessores
-   * = cinco posições de armazenamento.
-   */
-  const replicationNodes = [
-    state.node,
-    ...successors
-  ].slice(0, 5);
-
-  elements.replicationOwner.textContent =
-    state.node.id;
-
-  elements.replicationList.replaceChildren();
-
-  replicationNodes.slice(1).forEach((node, index) => {
-    const item = document.createElement('div');
-
-    item.className = 'replication-chip';
-
-    const id = document.createElement('strong');
-    id.textContent = node.id;
-
-    const role = document.createElement('small');
-    role.textContent = `Réplica ${index + 1}`;
-
-    item.append(id, role);
-
-    elements.replicationList.appendChild(item);
-  });
-}
-
 function render(state) {
   elements.nodeTitle.textContent = state.node.id;
   elements.currentId.textContent = state.node.id;
@@ -168,7 +97,6 @@ function render(state) {
   renderNode(elements.predecessorId, elements.predecessorAddress, state.predecessor);
   renderNode(elements.successorId, elements.successorAddress, state.successor);
   renderTable(state.fingerTable);
-  renderSuccessorList(state);
   renderRing(state);
   elements.lastUpdate.textContent = `Atualizado às ${new Date().toLocaleTimeString('pt-BR')}`;
 }

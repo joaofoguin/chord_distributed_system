@@ -5,6 +5,7 @@ const path = require('node:path');
 const { FINGER_COUNT, add, hashKey, inInterval, validateId } = require('./ring');
 
 const CATALOG_NAME = 'catalogo.txt';
+const REPLICATION_FACTOR = 5;
 
 class ChordNode {
   constructor({ id, host = '127.0.0.1', port = 5000, requestTimeout = 10000,
@@ -167,33 +168,106 @@ class ChordNode {
     return this.reference;
   }
 
-  /** Insere bytes na rede e devolve a posição do hash e o nó responsável. */
-  async put(fileName, content, { updateCatalog = true } = {}) {
+  /**
+   * Descobre o owner responsável por um arquivo.
+   *
+   * O owner é o sucessor do hash do nome do arquivo no anel Chord.
+   */
+  async findOwner(fileName) {
     this.assertJoined();
-    const name = validateFileName(fileName);
-    const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
-    const hashId = hashKey(name);
-    const owner = await this.findSuccessor(hashId);
 
-    if (owner.id === this.id) {
-      await this.storeLocal(name, bytes);
-    } else {
-      await this.rpc(owner, '/rpc/files', {
-        method: 'PUT',
-        body: { name, content: bytes.toString('base64') }
-      });
+    const name = validateFileName(fileName);
+    const hashId = hashKey(name);
+    const node = await this.findSuccessor(hashId);
+
+    return {
+      name,
+      hashId,
+      node
+    };
+  }
+
+    /**
+   * Descobre os peers que devem armazenar uma cópia do arquivo.
+   *
+   * A primeira posição é o owner da chave.
+   * As demais posições são os sucessores seguintes no anel.
+   *
+   * O conjunto possui no máximo REPLICATION_FACTOR peers distintos.
+   */
+  async findReplicaSet(fileName) {
+    const ownership = await this.findOwner(fileName);
+    const { name, hashId, node: owner } = ownership;
+
+    const replicas = [];
+    const visited = new Set();
+
+    let current = owner;
+
+    while (current && replicas.length < REPLICATION_FACTOR) {
+      if (visited.has(current.id)) break;
+
+      visited.add(current.id);
+      replicas.push(current);
+
+      const result = await this.rpc(current, '/rpc/successor');
+      current = result.node;
     }
 
-    if (updateCatalog && name !== CATALOG_NAME) await this.addToCatalog(name);
-    return { name, hashId, node: owner, size: bytes.length };
+    return {
+      name,
+      hashId,
+      owner,
+      replicas
+    };
+  }
+
+  /**
+   * Insere um arquivo na rede e cria cópias nos peers definidos
+   * pelo fator de replicação.
+   *
+   * A primeira posição do conjunto de réplicas é o owner.
+   */
+  async put(fileName, content, { updateCatalog = true } = {}) {
+    const replicaSet = await this.findReplicaSet(fileName);
+    const { name, hashId, owner, replicas } = replicaSet;
+
+    const bytes = Buffer.isBuffer(content)
+      ? content
+      : Buffer.from(content);
+
+    for (const replica of replicas) {
+      if (replica.id === this.id) {
+        await this.storeLocal(name, bytes);
+      } else {
+        await this.rpc(replica, '/rpc/files', {
+          method: 'PUT',
+          body: {
+            name,
+            content: bytes.toString('base64')
+          }
+        });
+      }
+    }
+
+    if (updateCatalog && name !== CATALOG_NAME) {
+      await this.addToCatalog(name);
+    }
+
+    return {
+      name,
+      hashId,
+      node: owner,
+      replicas,
+      size: bytes.length
+    };
   }
 
   /** Busca os bytes de um arquivo a partir de qualquer nó da rede. */
   async get(fileName) {
-    this.assertJoined();
-    const name = validateFileName(fileName);
-    const hashId = hashKey(name);
-    const owner = await this.findSuccessor(hashId);
+    const ownership = await this.findOwner(fileName);
+    const { name, hashId, node: owner } = ownership;
+
     let content;
 
     if (owner.id === this.id) {
