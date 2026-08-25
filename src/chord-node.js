@@ -141,6 +141,10 @@ class ChordNode {
       `Node ${this.id} entrou na rede | predecessor=${this.predecessor.id} | successor=${this.successor.id}`,
     );
 
+    // Busca uma cópia física do catálogo com um nó que já pertencia ao anel,
+    // para que este nó possa listar arquivos mesmo se vier a ser o dono do catálogo.
+    await this.adoptCatalogFrom(successor);
+
     await this.refreshFingerTable();
 
     // A entrada altera também as fingers dos nós que já estavam no anel.
@@ -148,7 +152,92 @@ class ChordNode {
       method: "POST",
       body: { originId: this.id, hops: 0 },
     });
+
+    // Garante que, após a entrada, somente `replicationFactor` nós guardem
+    // cada arquivo (o nó novo pode assumir cópias que saem da janela de réplicas).
+    try {
+      await this.replicationManager.rebalanceAll();
+    } catch (rebalanceError) {
+      replication(
+        `Falha ao rebalancear réplicas após entrada do Node ${this.id}: ${rebalanceError.message}`,
+      );
+    }
+
     return this.state();
+  }
+
+  /** Saída graciosa: reconecta os vizinhos e restabelece o fator de replicação. */
+  async leave() {
+    this.assertJoined();
+    section("[CHORD] SAÍDA DE NÓ");
+    chord(`Node ${this.id} saindo da rede`);
+
+    const successor = this.successor;
+    const predecessor = this.predecessor;
+
+    if (!successor || successor.id === this.id) {
+      this.joined = false;
+      this.predecessor = null;
+      for (const finger of this.fingers) finger.node = null;
+      chord(`Node ${this.id} era o único nó da rede.`);
+      return { ok: true };
+    }
+
+    // Reconecta predecessor e sucessor diretamente, removendo este nó do anel.
+    await this.rpc(predecessor, "/rpc/successor", {
+      method: "PUT",
+      body: { node: successor },
+    });
+    await this.rpc(successor, "/rpc/predecessor", {
+      method: "PUT",
+      body: { node: predecessor },
+    });
+
+    this.joined = false;
+
+    chord(
+      `Node ${this.id} saiu | Node ${predecessor.id} agora aponta para Node ${successor.id}`,
+    );
+
+    try {
+      await this.rpc(successor, "/rpc/refresh-fingers", {
+        method: "POST",
+        body: { originId: successor.id, hops: 0 },
+      });
+    } catch (refreshError) {
+      network(
+        `Falha ao atualizar finger tables após saída do Node ${this.id}: ${refreshError.message}`,
+      );
+    }
+
+    // O restante do anel precisa recompor as cópias que este nó guardava.
+    try {
+      await this.rpc(successor, "/rpc/rebalance", { method: "POST" });
+    } catch (rebalanceError) {
+      replication(
+        `Falha ao rebalancear réplicas após saída do Node ${this.id}: ${rebalanceError.message}`,
+      );
+    }
+
+    return { ok: true };
+  }
+
+  /** Copia o catálogo de um nó que já pertence ao anel para o armazenamento local. */
+  async adoptCatalogFrom(source) {
+    try {
+      const result = await this.rpc(
+        source,
+        `/rpc/files?name=${encodeURIComponent(CATALOG_NAME)}`,
+      );
+      await this.storeLocal(CATALOG_NAME, Buffer.from(result.content, "base64"));
+    } catch (adoptError) {
+      if (
+        adoptError.code !== "ENOENT" &&
+        !/não encontrado/i.test(adoptError.message)
+      ) {
+        network(`Não foi possível obter o catálogo ao entrar: ${adoptError.message}`);
+      }
+    }
   }
 
   async updateCatalogOnAllNodes(content) {
@@ -221,7 +310,9 @@ class ChordNode {
 
   async refreshRingFingerTables(originId, hops = 0) {
     validateId(originId);
-    if (this.id === Number(originId)) return { ok: true };
+    // Só interrompe ao completar uma volta (hops > 0); isso permite usar o
+    // próprio nó de partida como origem (necessário após uma saída de nó).
+    if (hops > 0 && this.id === Number(originId)) return { ok: true };
     if (hops >= 32)
       throw new Error("Limite de nós excedido ao atualizar finger tables");
 
@@ -359,18 +450,22 @@ class ChordNode {
     return { name, hashId, node: owner, size: content.length, content };
   }
 
-  async addToCatalog(fileName) {
-    let names = [];
-
+  /** Lista os nomes de arquivos conhecidos pela rede (exclui o próprio catálogo). */
+  async listCatalog() {
     try {
       const catalog = await this.get(CATALOG_NAME);
 
-      names = catalog.content.toString("utf8").split(/\r?\n/).filter(Boolean);
+      return catalog.content.toString("utf8").split(/\r?\n/).filter(Boolean);
     } catch (error) {
-      if (error.code !== "ENOENT" && !/não encontrado/i.test(error.message)) {
-        throw error;
+      if (error.code === "ENOENT" || /não encontrado/i.test(error.message)) {
+        return [];
       }
+      throw error;
     }
+  }
+
+  async addToCatalog(fileName) {
+    const names = await this.listCatalog();
 
     if (!names.includes(fileName)) {
       names.push(fileName);
@@ -402,6 +497,28 @@ class ChordNode {
         throw notFound;
       }
       throw error;
+    }
+  }
+
+  async deleteLocal(fileName) {
+    const name = validateFileName(fileName);
+    try {
+      await fs.unlink(path.join(this.storageDirectory, name));
+      storage(`Node ${this.id} removeu cópia local de "${name}"`);
+      return true;
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  async hasLocal(fileName) {
+    const name = validateFileName(fileName);
+    try {
+      await fs.access(path.join(this.storageDirectory, name));
+      return true;
+    } catch {
+      return false;
     }
   }
 
