@@ -57,6 +57,13 @@ class ChordNode {
     // anel (join/leave). Serve de plano B quando o sucessor imediato some sem
     // avisar a rede (ex.: computador desligado) — ver promoteNextSuccessor.
     this.successorList = [];
+    // Nós que falharam recentemente (timeout/conexão recusada). Enquanto um
+    // id estiver aqui, novas chamadas a ele falham na hora em vez de esperar
+    // o timeout inteiro de novo — evita que várias operações concorrentes
+    // (rebalanceamento, refresh de fingers, buscas) fiquem cada uma na sua
+    // vez tentando de novo o mesmo nó morto por 10s.
+    this.deadNodes = new Map();
+    this.deadNodeCooldownMs = 15000;
 
     this.replicationManager = new ReplicationManager(
       this,
@@ -366,7 +373,7 @@ class ChordNode {
       // Antes de responder, garante que o sucessor apontado ainda está vivo;
       // se não estiver, promove o próximo sucessor conhecido e repara o
       // anel, para o pedido não falhar por causa de um nó que já caiu.
-      const owner = await this.resolveLiveSuccessor();
+      const owner = await this.ensureLiveSuccessor();
 
       if (logLookup) {
         chord(
@@ -385,10 +392,9 @@ class ChordNode {
 
   /**
    * Tenta encaminhar a busca pela finger table; se o nó escolhido estiver
-   * inacessível, tenta as próximas fingers e por fim o sucessor. Se o
-   * próprio sucessor estiver morto, promove um substituto conhecido
-   * (successorList) e repete — permite que a rede continue respondendo
-   * mesmo quando um ou mais nós saíram sem avisar (ex.: PC desligado).
+   * inacessível, tenta as próximas fingers e por fim o sucessor (já curado,
+   * se preciso) — permite que a rede continue respondendo mesmo quando um
+   * ou mais nós saíram sem avisar (ex.: PC desligado).
    */
   async routeFindSuccessor(id, hops, logLookup) {
     const attempted = new Set();
@@ -413,38 +419,18 @@ class ChordNode {
           `Node ${candidate.id} inacessível ao rotear hash ${id}: ${rpcError.message}`,
         );
 
-        if (this.successor && candidate.id === this.successor.id) {
-          const replacement = this.promoteNextSuccessor(candidate.id);
-          candidate = replacement && !attempted.has(replacement.id) ? replacement : null;
-          continue;
-        }
+        // Se o candidato que falhou era (ou é) o sucessor, deixa a cura
+        // compartilhada resolver — em vez de cada busca concorrente tentar
+        // substituir por conta própria e disputar a mesma lista.
+        const live = this.successor && candidate.id === this.successor.id
+          ? await this.ensureLiveSuccessor()
+          : this.successor;
 
-        if (this.successor && !attempted.has(this.successor.id)) {
-          candidate = this.successor;
-          continue;
-        }
-
-        throw rpcError;
+        candidate = live && !attempted.has(live.id) ? live : null;
       }
     }
 
     throw new Error(`Nenhuma rota viva encontrada para localizar o sucessor do hash ${id}`);
-  }
-
-  /** Confirma que this.successor responde; senão, promove o próximo vivo. */
-  async resolveLiveSuccessor() {
-    for (let attempts = 0; attempts < this.fingers.length + 2; attempts += 1) {
-      if (this.successor.id === this.id) return this.reference;
-      if (await this.isReachable(this.successor)) return this.successor;
-
-      const replacement = this.promoteNextSuccessor(this.successor.id);
-      if (!replacement) {
-        throw new Error(
-          `Node ${this.successor.id} (sucessor) está inacessível e não há substituto conhecido`,
-        );
-      }
-    }
-    throw new Error("Limite de tentativas excedido ao substituir sucessores inacessíveis");
   }
 
   async isReachable(node) {
@@ -457,44 +443,76 @@ class ChordNode {
   }
 
   /**
-   * Remove um sucessor morto e assume o próximo nó vivo conhecido em
-   * `successorList` (calculada durante o último join/leave via
-   * ReplicationManager.getReplicaNodes). Equivale a uma "saída forçada" do
-   * nó que caiu, aplicada pelo vizinho que percebeu a falha.
+   * Garante que this.successor responde, corrigindo o anel se não. Só uma
+   * execução roda por vez: se várias buscas descobrem a falha ao mesmo
+   * tempo (ex.: os 5 lookups paralelos de refreshFingerTable), todas
+   * aguardam e reaproveitam o mesmo resultado, em vez de cada uma podar a
+   * successorList por conta própria — era essa disputa concorrente que
+   * esvaziava a lista cedo demais e travava a rede em timeouts repetidos.
    */
-  promoteNextSuccessor(deadId) {
-    if (!this.successor || this.successor.id !== deadId) {
-      // Outra chamada concorrente já corrigiu o sucessor.
-      return this.successor && this.successor.id !== deadId ? this.successor : null;
+  ensureLiveSuccessor() {
+    if (!this._healingSuccessor) {
+      this._healingSuccessor = this._healSuccessor().finally(() => {
+        this._healingSuccessor = null;
+      });
     }
+    return this._healingSuccessor;
+  }
 
-    this.successorList = this.successorList.filter((node) => node.id !== deadId);
-    const next = this.successorList.find((node) => node.id !== this.id) || null;
+  async _healSuccessor() {
+    const startedFrom = this.successor ? this.successor.id : null;
 
-    if (!next) {
-      this.successor = this.reference;
-      this.predecessor = this.reference;
-      error(
-        `Node ${this.id} não encontrou substituto vivo para Node ${deadId}; assumindo o anel sozinho`,
+    for (let attempts = 0; attempts < this.fingers.length + 3; attempts += 1) {
+      if (!this.successor || this.successor.id === this.id) {
+        return this.reference;
+      }
+      if (await this.isReachable(this.successor)) {
+        if (this.successor.id !== startedFrom) this.notifyNewSuccessor(this.successor);
+        return this.successor;
+      }
+
+      const deadId = this.successor.id;
+      this.successorList = this.successorList.filter((node) => node.id !== deadId);
+      const next = this.successorList.find((node) => node.id !== this.id) || null;
+
+      if (!next) {
+        this.successor = this.reference;
+        this.predecessor = this.reference;
+        error(
+          `Node ${this.id} não encontrou substituto vivo para Node ${deadId}; assumindo o anel sozinho`,
+        );
+        return this.successor;
+      }
+
+      this.successor = next;
+      chord(
+        `Node ${this.id} substituiu sucessor inacessível (Node ${deadId}) por Node ${next.id}`,
       );
-      return this.successor;
+      // Continua o laço: confirma que `next` de fato responde antes de
+      // devolvê-lo — se vários nós do mesmo computador caíram juntos, pode
+      // ser preciso pular mais de um antes de achar um vivo de verdade.
     }
+    throw new Error("Limite de tentativas excedido ao substituir sucessores inacessíveis");
+  }
 
-    this.successor = next;
-    chord(
-      `Node ${this.id} substituiu sucessor inacessível (Node ${deadId}) por Node ${next.id}`,
-    );
-
+  /** Efeitos colaterais de assumir um novo sucessor — dispara em segundo plano. */
+  notifyNewSuccessor(next) {
     this.rpc(next, "/rpc/predecessor", {
       method: "PUT",
       body: { node: this.reference },
     }).catch((notifyError) => {
       network(
-        `Falha ao notificar Node ${next.id} sobre a saída de Node ${deadId}: ${notifyError.message}`,
+        `Falha ao notificar Node ${next.id} sobre a troca de sucessor: ${notifyError.message}`,
       );
     });
     this.refreshFingerTable().catch(() => {});
-    this.refreshSuccessorList().catch(() => {});
+    // Importante: NÃO recalcula successorList aqui a partir do novo
+    // sucessor. Se ele também estiver morto, esse recálculo falharia cedo
+    // e substituiria a lista boa (que ainda tem outros candidatos vivos
+    // mais à frente) por uma lista truncada — foi isso que causava a rede
+    // parecer travada num loop de timeouts. A lista já foi podada em
+    // _healSuccessor; o próximo join/leave/refresh-fingers bem-sucedido é
+    // quem a repõe com dados frescos.
     setImmediate(() => {
       this.rpc(next, "/rpc/refresh-fingers", {
         method: "POST",
@@ -502,12 +520,10 @@ class ChordNode {
       }).catch(() => {});
       this.replicationManager.rebalanceAll().catch((rebalanceError) => {
         replication(
-          `Falha ao rebalancear após remoção de Node ${deadId}: ${rebalanceError.message}`,
+          `Falha ao rebalancear após troca de sucessor: ${rebalanceError.message}`,
         );
       });
     });
-
-    return this.successor;
   }
 
   /** Recalcula os próximos sucessores vivos, usado como plano B de rota. */
@@ -692,36 +708,73 @@ class ChordNode {
     if (!this.joined) throw new Error("O nó ainda não entrou em uma rede");
   }
 
+  /** true se `id` falhou recentemente e ainda está dentro do "período de quarentena". */
+  isKnownDead(id) {
+    const expiresAt = this.deadNodes.get(id);
+    if (expiresAt === undefined) return false;
+    if (Date.now() >= expiresAt) {
+      this.deadNodes.delete(id);
+      return false;
+    }
+    return true;
+  }
+
+  markDead(id) {
+    this.deadNodes.set(id, Date.now() + this.deadNodeCooldownMs);
+  }
+
+  clearDead(id) {
+    if (this.deadNodes.delete(id)) {
+      network(`Node ${id} voltou a responder; removido da lista de inacessíveis`);
+    }
+  }
+
   async rpc(node, path, { method = "GET", body } = {}) {
     const target = normalizeReference(node);
+    const isSelf = target.id === this.id;
+
+    // Um nó marcado como morto recentemente falha na hora, sem esperar o
+    // timeout de novo — é isso que evita a rede inteira ficar "presa"
+    // tentando, uma operação de cada vez, alcançar quem já caiu.
+    if (!isSelf && this.isKnownDead(target.id)) {
+      const skip = new Error(
+        `Node ${target.id} está marcado como inacessível (nova tentativa em instantes)`,
+      );
+      skip.code = "ETIMEDOUT";
+      throw skip;
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.requestTimeout);
+    let response;
     try {
-      const response = await fetch(
-        `http://${target.host}:${target.port}${path}`,
-        {
-          method,
-          headers: body ? { "content-type": "application/json" } : undefined,
-          body: body ? JSON.stringify(body) : undefined,
-          signal: controller.signal,
-        },
-      );
-      const data = await response.json();
-      if (!response.ok)
-        throw new Error(data.error || `Erro HTTP ${response.status}`);
-      return data;
-    } catch (error) {
-      if (error.name === "AbortError") {
+      response = await fetch(`http://${target.host}:${target.port}${path}`, {
+        method,
+        headers: body ? { "content-type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+    } catch (networkError) {
+      if (!isSelf) this.markDead(target.id);
+      if (networkError.name === "AbortError") {
         const timeout = new Error(
           `Tempo limite ao acessar o nó ${target.id} em ${target.host}:${target.port}`,
         );
         timeout.code = "ETIMEDOUT";
         throw timeout;
       }
-      throw error;
+      throw networkError;
     } finally {
       clearTimeout(timer);
     }
+
+    // Respondeu (mesmo que com erro HTTP de aplicação): o nó está vivo.
+    if (!isSelf) this.clearDead(target.id);
+
+    const data = await response.json();
+    if (!response.ok)
+      throw new Error(data.error || `Erro HTTP ${response.status}`);
+    return data;
   }
 
   state() {

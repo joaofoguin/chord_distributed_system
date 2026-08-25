@@ -174,6 +174,14 @@ abrupta, com dois sintomas concretos:
 2. **Um arquivo cujo hash caísse exatamente na posição do nó morto não
    conseguia ser salvo nem lido**, porque a busca do sucessor insistia em
    contatar esse nó e recebia erro de conexão.
+3. **Quando vários nós caíam juntos** (ex.: um computador com vários peers
+   sendo desligado de uma vez, ou simplesmente fechando a aplicação), a rede
+   parecia travar num loop — várias operações concorrentes (rebalanceamento,
+   refresh de finger table, buscas) tentavam alcançar os mesmos nós mortos
+   repetidamente, cada uma esperando o timeout inteiro de novo, e a lista de
+   sucessores de reserva podia se esgotar cedo demais por disputa entre
+   buscas concorrentes — o nó chegava a concluir (errado) que estava sozinho
+   no anel.
 
 ### Correção 1 — o catálogo não depende mais de rotear pela DHT
 
@@ -192,18 +200,19 @@ não tinha nenhum antes):
   conhecidos (reaproveita `ReplicationManager.getReplicaNodes`, a mesma
   lógica da replicação), atualizada a cada `join` e a cada vez que o
   `refresh-fingers` percorre o anel. É o "plano B" de rota.
-- **`promoteNextSuccessor(deadId)`** — quando um nó percebe que seu sucessor
-  imediato não responde, remove-o da lista, assume o próximo vivo conhecido
-  no lugar, avisa esse novo sucessor (`PUT /rpc/predecessor`), atualiza a
-  própria finger table e dispara `refresh-fingers` + `rebalanceAll` em
-  segundo plano. Na prática, é o vizinho aplicando uma "saída forçada" no nó
-  que sumiu, no lugar de esperar por um `/leave` que nunca vai chegar.
-- **`findSuccessor`** ganhou duas fases: `resolveLiveSuccessor()` confirma
-  que o sucessor responde antes de devolver a resposta final (e cura se não
-  responder) e `routeFindSuccessor()` tenta a finger mais distante, cai para
-  as próximas, cai para o sucessor e, se o próprio sucessor estiver morto,
-  promove um substituto e tenta de novo — em vez de estourar o timeout e
-  falhar a busca inteira.
+- **`ensureLiveSuccessor()` / `_healSuccessor()`** — quando um nó percebe que
+  seu sucessor imediato não responde, remove-o da lista, tenta o próximo
+  vivo conhecido, e repete até confirmar um que responda de verdade (ou
+  esgotar a lista). Ao encontrar um substituto, avisa-o (`PUT
+  /rpc/predecessor`), atualiza a própria finger table e dispara
+  `refresh-fingers` + `rebalanceAll` em segundo plano — o vizinho aplicando
+  uma "saída forçada" no nó que sumiu, em vez de esperar por um `/leave` que
+  nunca vai chegar.
+- **`findSuccessor`** ganhou duas fases: a resposta final passa por
+  `ensureLiveSuccessor()` antes de ser devolvida, e `routeFindSuccessor()`
+  tenta a finger mais distante, cai para as próximas e, se o próprio
+  sucessor estiver morto, aciona a mesma cura — em vez de estourar o timeout
+  e falhar a busca inteira.
 - **`getAllNodes()`** (usada pelo broadcast do catálogo e pelo
   rebalanceamento) e **`getReplicaNodes()`** (usada pela replicação e pela
   `successorList`) passaram a parar o percurso e seguir com o que já
@@ -212,19 +221,52 @@ não tinha nenhum antes):
 
 O resultado é que uma chave cujo dono morreu passa a ser automaticamente
 reatribuída ao próximo nó vivo do anel, com os ponteiros do anel
-efetivamente corrigidos — não é um "tentar de novo" pontual. Testamos assim:
-subimos 6 nós, matamos um deles (`kill -9`, sem `/leave`) exatamente na
-posição de um arquivo novo, e o log mostrou a correção acontecendo sozinha:
+efetivamente corrigidos — não é um "tentar de novo" pontual.
+
+### Correção 3 — vários nós caindo juntos não trava mais a rede num loop
+
+Testando o cenário de um computador com **vários peers** sendo desligado de
+uma vez (não só um nó isolado), apareceram dois problemas novos:
+
+- Cada operação que tentava alcançar um dos nós mortos esperava o timeout
+  inteiro (10s) de novo, mesmo que aquele nó já tivesse falhado segundos
+  antes em outra chamada — e como várias operações concorrentes faziam isso
+  ao mesmo tempo, os timeouts se empilhavam e a rede parecia travada.
+- As 5 buscas concorrentes disparadas por `refreshFingerTable()` cada uma
+  tentava corrigir o sucessor morto por conta própria, disputando a mesma
+  `successorList` ao mesmo tempo — uma promoção "roubava" o candidato que
+  outra também ia usar, esvaziando a lista cedo demais e fazendo o nó
+  concluir (errado) que estava sozinho no anel.
+
+Duas mudanças resolveram isso:
+
+- **Cache de nós mortos** (`ChordNode.deadNodes`, expira em 15s) — depois da
+  primeira falha real contra um nó, `rpc()` passa a rejeitar novas tentativas
+  contra ele **na hora**, sem novo timeout, até o prazo expirar. Se o nó
+  responder de novo a qualquer momento, ele sai do cache imediatamente.
+- **Cura do sucessor centralizada** — `ensureLiveSuccessor()` agora só deixa
+  **uma** correção rodar por vez; se várias buscas descobrem a falha ao
+  mesmo tempo, todas aguardam e reaproveitam o mesmo resultado em vez de
+  mexer na `successorList` cada uma por conta própria. O mesmo vale para o
+  rebalanceamento: `ReplicationManager.rebalanceAll()` reaproveita uma
+  execução já em andamento em vez de disparar varreduras duplicadas pela
+  rede quando mais de um nó percebe a falha ao mesmo tempo.
+
+Testamos assim: um "computador A" hospedando os nós 1, 6 e 12 no mesmo
+processo, e um "computador B" com os nós 18, 24 e 30. Derrubamos o processo
+inteiro do computador A de uma vez (`kill -9`, sem `/leave`) e em seguida
+fizemos 6 uploads seguidos pelo nó mais afetado (30, cujo sucessor direto
+era o nó 1, agora morto):
 
 ```
-[NETWORK] Node 18 inacessível ao rotear hash 19: fetch failed
-[CHORD] Node 12 substituiu sucessor inacessível (Node 18) por Node 24
+[CHORD] Node 30 substituiu sucessor inacessível (Node 1) por Node 6
+[CHORD] Node 30 substituiu sucessor inacessível (Node 6) por Node 12
+[CHORD] Node 30 substituiu sucessor inacessível (Node 12) por Node 18
 ```
 
-Depois disso, `Node 12` passou a apontar para `Node 24` como sucessor (e
-`Node 24` passou a apontar para `Node 12` como predecessor) permanentemente,
-sem precisar de nenhuma intervenção manual, e o `put` do arquivo terminou
-com sucesso e as 5 réplicas confirmadas.
+Todos os 6 uploads tiveram sucesso (HTTP 201) em menos de 45ms cada, e o
+anel dos 3 sobreviventes fechou corretamente (`18 → 24 → 30 → 18`), sem
+nenhum nó "sozinho" nem intervenção manual.
 
 ### Limite que ainda existe
 
