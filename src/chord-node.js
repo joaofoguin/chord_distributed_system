@@ -473,7 +473,17 @@ class ChordNode {
 
       const deadId = this.successor.id;
       this.successorList = this.successorList.filter((node) => node.id !== deadId);
-      const next = this.successorList.find((node) => node.id !== this.id) || null;
+      let next = this.successorList.find((node) => node.id !== this.id) || null;
+
+      if (!next) {
+        // A successorList só guarda os poucos próximos sucessores — se
+        // todos eles caíram juntos (ex.: vários nós no mesmo computador
+        // desligado), ela se esgota mesmo havendo outros nós vivos mais
+        // longe no anel. Antes de desistir, pergunta pela finger table
+        // (que enxerga muito mais longe) e pelo predecessor quem é o
+        // verdadeiro próximo nó vivo.
+        next = await this.discoverLiveSuccessorViaFingers();
+      }
 
       if (!next) {
         this.successor = this.reference;
@@ -524,6 +534,46 @@ class ChordNode {
         );
       });
     });
+  }
+
+  /**
+   * Última tentativa antes de declarar o anel "sozinho": pergunta a cada
+   * entrada distinta da finger table (que alcança muito mais longe que a
+   * successorList) e ao predecessor quem é o verdadeiro sucessor logo após
+   * este nó. Cobre o caso em que TODOS os nós da successorList caíram
+   * juntos, mas o anel como um todo continua vivo em algum ponto mais
+   * distante.
+   */
+  async discoverLiveSuccessorViaFingers() {
+    const seen = new Set([this.id]);
+    const candidates = [];
+
+    for (let i = this.fingers.length - 1; i >= 0; i -= 1) {
+      const node = this.fingers[i].node;
+      if (node && !seen.has(node.id)) {
+        seen.add(node.id);
+        candidates.push(node);
+      }
+    }
+    if (this.predecessor && !seen.has(this.predecessor.id)) {
+      candidates.push(this.predecessor);
+    }
+
+    for (const candidate of candidates) {
+      // Usa /rpc/successor — uma consulta local, sem roteamento — em vez de
+      // pedir para o candidato resolver find-successor. Se pedíssemos a ele
+      // para rotear, ele poderia legitimamente precisar voltar a perguntar
+      // a este mesmo nó (que está bloqueado esperando esta própria cura),
+      // um deadlock resolvido só pelo timeout de 10s.
+      if (await this.isReachable(candidate)) {
+        network(
+          `Node ${this.id} recuperou o anel via finger table: adotando Node ${candidate.id} como sucessor`,
+        );
+        return candidate;
+      }
+    }
+
+    return null;
   }
 
   /** Recalcula os próximos sucessores vivos, usado como plano B de rota. */
