@@ -49,6 +49,7 @@ class ChordNode {
     this.storageDirectory =
       storageDirectory ||
       path.join(process.cwd(), "data", `node-${this.id}-${this.port}`);
+    this.enableLookupLogs = false;
     this.predecessor = null;
     this.fingers = this.buildEmptyFingerTable();
     this.joined = false;
@@ -242,10 +243,11 @@ class ChordNode {
     return { ok: true };
   }
 
-  async findSuccessor(rawId, hops = 0) {
+  async findSuccessor(rawId, hops = 0, options = {}) {
     const id = validateId(rawId);
+    const logLookup = options.log === true;
 
-    if (hops === 0) {
+    if (hops === 0 && logLookup) {
       chord(`Localizando sucessor para hash ${id} a partir do Node ${this.id}`);
     }
     if (!this.joined || !this.successor)
@@ -254,9 +256,11 @@ class ChordNode {
     if (id === this.id) return this.reference;
 
     if (inInterval(id, this.id, this.successor.id, false, true)) {
-      chord(
-        `Hash ${id} encontrado entre Node ${this.id} e Node ${this.successor.id} → sucessor Node ${this.successor.id}`,
-      );
+      if (logLookup) {
+        chord(
+          `Hash ${id} encontrado entre Node ${this.id} e Node ${this.successor.id} → sucessor Node ${this.successor.id}`,
+        );
+      }
 
       return this.successor;
     }
@@ -265,7 +269,9 @@ class ChordNode {
       throw new Error("Limite de saltos excedido ao procurar sucessor");
     let next = this.closestPrecedingFinger(id);
 
-    chord(`Node ${this.id} encaminhando hash ${id} para Node ${next.id}`);
+    if (logLookup) {
+      chord(`Node ${this.id} encaminhando hash ${id} para Node ${next.id}`);
+    }
     // Uma finger table ainda desatualizada não deve interromper a busca:
     // caminhar pelo sucessor sempre encontra a posição correta no anel.
     if (next.id === this.id) next = this.successor;
@@ -306,7 +312,9 @@ class ChordNode {
     chord(`Hash        : ${hashId}`);
 
     // O Chord continua sendo responsável por descobrir o owner.
-    const owner = await this.findSuccessor(hashId);
+    const owner = await this.findSuccessor(hashId, 0, {
+      log: true,
+    });
 
     chord(`Owner       : Node ${owner.id}`);
     chord(`Tamanho     : ${bytes.length} bytes`);
