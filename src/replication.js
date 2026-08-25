@@ -1,6 +1,6 @@
 "use strict";
 
-const { RING_SIZE } = require("./ring");
+const { RING_SIZE, hashKey } = require("./ring");
 
 const { section, replication, error } = require("./logger");
 
@@ -130,6 +130,116 @@ class ReplicationManager {
       replicationFactor: this.replicationFactor,
       copies: results,
     };
+  }
+
+  /**
+   * Recalcula, para um arquivo já existente, quais nós devem guardá-lo após
+   * uma entrada ou saída no anel, e ajusta as cópias para que exatamente
+   * `replicationFactor` nós (owner + sucessores) as mantenham — nem mais, nem menos.
+   */
+  async rebalanceFile(name) {
+    const hashId = hashKey(name);
+    const owner = await this.node.findSuccessor(hashId);
+    const desired = await this.getReplicaNodes(owner);
+    const desiredIds = new Set(desired.map((target) => target.id));
+
+    const allNodes = await this.node.getAllNodes();
+
+    const holders = [];
+    for (const candidate of allNodes) {
+      if (await this.remoteHasFile(candidate, name)) holders.push(candidate);
+    }
+
+    if (holders.length === 0) return { name, added: [], removed: [] };
+
+    const source = holders.find((holder) => desiredIds.has(holder.id)) || holders[0];
+    const content = await this.remoteReadFile(source, name);
+
+    const added = [];
+    for (const target of desired) {
+      if (holders.some((holder) => holder.id === target.id)) continue;
+
+      await this.remoteWriteFile(
+        target,
+        name,
+        content,
+        target.id === owner.id ? "OWNER" : "REPLICA",
+        owner.id,
+      );
+      added.push(target.id);
+    }
+
+    const removed = [];
+    for (const holder of holders) {
+      if (desiredIds.has(holder.id)) continue;
+
+      await this.remoteDeleteFile(holder, name);
+      removed.push(holder.id);
+    }
+
+    if (added.length || removed.length) {
+      replication(
+        `Arquivo "${name}" rebalanceado | novas cópias: ${added.join(", ") || "-"} | removidas: ${removed.join(", ") || "-"}`,
+      );
+    }
+
+    return { name, added, removed };
+  }
+
+  /** Rebalanceia todos os arquivos conhecidos pelo catálogo. Chamado após entrada/saída de nós. */
+  async rebalanceAll() {
+    const files = await this.node.listCatalog();
+    if (files.length === 0) return [];
+
+    section("[REPLICATION] REBALANCEAMENTO DO FATOR DE REPLICAÇÃO");
+    replication(`Arquivos no catálogo: ${files.length}`);
+
+    const results = [];
+    for (const name of files) {
+      try {
+        results.push(await this.rebalanceFile(name));
+      } catch (rebalanceError) {
+        error(`Falha ao rebalancear "${name}": ${rebalanceError.message}`);
+      }
+    }
+
+    console.log("=".repeat(60));
+    return results;
+  }
+
+  async remoteHasFile(target, name) {
+    if (target.id === this.node.id) return this.node.hasLocal(name);
+    const result = await this.node.rpc(
+      target,
+      `/rpc/files/exists?name=${encodeURIComponent(name)}`,
+    );
+    return Boolean(result.exists);
+  }
+
+  async remoteReadFile(target, name) {
+    if (target.id === this.node.id) return this.node.readLocal(name);
+    const result = await this.node.rpc(
+      target,
+      `/rpc/files?name=${encodeURIComponent(name)}`,
+    );
+    return Buffer.from(result.content, "base64");
+  }
+
+  async remoteWriteFile(target, name, content, role, ownerId) {
+    if (target.id === this.node.id) {
+      return this.node.storeLocal(name, content);
+    }
+    return this.node.rpc(target, "/rpc/files", {
+      method: "PUT",
+      body: { name, content: content.toString("base64"), role, ownerId },
+    });
+  }
+
+  async remoteDeleteFile(target, name) {
+    if (target.id === this.node.id) return this.node.deleteLocal(name);
+    return this.node.rpc(target, `/rpc/files?name=${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
   }
 }
 

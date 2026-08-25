@@ -69,6 +69,15 @@ async function handleNodeRequest(node, request, response) {
       const { bootstrap = null } = await readJson(request);
       return json(response, 200, await node.join(bootstrap));
     }
+    if (request.method === "POST" && url.pathname === "/leave") {
+      return json(response, 200, await node.leave());
+    }
+    if (request.method === "POST" && url.pathname === "/rpc/rebalance") {
+      return json(response, 200, {
+        ok: true,
+        files: await node.replicationManager.rebalanceAll(),
+      });
+    }
     if (request.method === "POST" && url.pathname === "/rpc/find-successor") {
       const body = await readJson(request);
       return json(
@@ -130,6 +139,15 @@ async function handleNodeRequest(node, request, response) {
       const name = url.searchParams.get("name");
       const content = await node.readLocal(name);
       return json(response, 200, { name, content: content.toString("base64") });
+    }
+    if (request.method === "GET" && url.pathname === "/rpc/files/exists") {
+      const name = url.searchParams.get("name");
+      return json(response, 200, { exists: await node.hasLocal(name) });
+    }
+    if (request.method === "DELETE" && url.pathname === "/rpc/files") {
+      const name = url.searchParams.get("name");
+      const removed = await node.deleteLocal(name);
+      return json(response, 200, { ok: true, removed });
     }
     return json(response, 404, { error: "Rota não encontrada" });
   } catch (error) {

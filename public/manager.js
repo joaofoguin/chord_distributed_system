@@ -49,7 +49,8 @@ async function loadNodes() {
           <span>${nodeAddress(state.node)}</span>
         </div>
         <div class="node-links"><span>← ${predecessor}</span><span>${successor} →</span></div>
-        <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>`;
+        <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>
+        <button class="button danger" type="button" data-leave="${state.node.port}">Remover</button>`;
       return card;
     }));
   } catch (error) {
@@ -90,6 +91,25 @@ form.addEventListener('submit', async (event) => {
     message.textContent = error.message;
   } finally {
     button.disabled = false;
+  }
+});
+
+list.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-leave]');
+  if (!button) return;
+  const port = button.dataset.leave;
+  button.disabled = true;
+  button.textContent = 'Removendo…';
+  try {
+    const response = await fetch(`/api/nodes/${port}`, { method: 'DELETE' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error);
+    await loadNodes();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'Remover';
+    message.className = 'form-message error';
+    message.textContent = `Falha ao remover nó da porta ${port}: ${error.message}`;
   }
 });
 
