@@ -64,6 +64,12 @@ class ChordNode {
     // vez tentando de novo o mesmo nó morto por 10s.
     this.deadNodes = new Map();
     this.deadNodeCooldownMs = 15000;
+    // Verificação periódica em segundo plano (predecessor, sucessor e
+    // finger table) — sem ela, um nó que nunca recebe upload/download não
+    // percebe sozinho que um vizinho caiu, e a tela continua mostrando o
+    // nó morto até alguma operação forçar uma busca.
+    this.stabilizeIntervalMs = 6000;
+    this._stabilizeTimer = null;
 
     this.replicationManager = new ReplicationManager(
       this,
@@ -96,6 +102,7 @@ class ChordNode {
     for (const finger of this.fingers) finger.node = this.reference;
     this.successorList = [this.reference];
     this.joined = true;
+    this.startStabilization();
   }
 
   async join(bootstrap) {
@@ -176,6 +183,7 @@ class ChordNode {
       );
     }
 
+    this.startStabilization();
     return this.state();
   }
 
@@ -192,6 +200,7 @@ class ChordNode {
       this.joined = false;
       this.predecessor = null;
       for (const finger of this.fingers) finger.node = null;
+      this.stopStabilization();
       chord(`Node ${this.id} era o único nó da rede.`);
       return { ok: true };
     }
@@ -207,6 +216,7 @@ class ChordNode {
     });
 
     this.joined = false;
+    this.stopStabilization();
 
     chord(
       `Node ${this.id} saiu | Node ${predecessor.id} agora aponta para Node ${successor.id}`,
@@ -587,6 +597,55 @@ class ChordNode {
         `Falha ao atualizar lista de sucessores do Node ${this.id}: ${refreshError.message}`,
       );
     }
+  }
+
+  /** Liga a verificação periódica de saúde do anel (idempotente). */
+  startStabilization() {
+    if (this._stabilizeTimer) return;
+    this._stabilizeTimer = setInterval(() => {
+      this.stabilizeTick().catch((tickError) => {
+        network(`Falha na verificação periódica do Node ${this.id}: ${tickError.message}`);
+      });
+    }, this.stabilizeIntervalMs);
+    // unref: esse timer é só manutenção em segundo plano, não deve impedir
+    // o processo de encerrar (ex.: nos testes automatizados).
+    this._stabilizeTimer.unref();
+  }
+
+  stopStabilization() {
+    if (this._stabilizeTimer) {
+      clearInterval(this._stabilizeTimer);
+      this._stabilizeTimer = null;
+    }
+  }
+
+  /**
+   * Roda a cada `stabilizeIntervalMs`: confirma que sucessor e predecessor
+   * ainda respondem (curando o sucessor se não) e atualiza a finger table.
+   * É isso que faz um nó morto sumir da tela sozinho — sem essa checagem
+   * periódica, o painel só percebe a queda quando algum put/get força uma
+   * busca que passe por ali.
+   */
+  async stabilizeTick() {
+    if (!this.joined) return;
+
+    await this.ensureLiveSuccessor().catch((healError) => {
+      network(`Node ${this.id} não conseguiu curar o sucessor: ${healError.message}`);
+    });
+
+    if (this.predecessor && this.predecessor.id !== this.id) {
+      const alive = await this.isReachable(this.predecessor);
+      if (!alive) {
+        network(
+          `Node ${this.id} removeu Node ${this.predecessor.id} do predecessor (não responde mais)`,
+        );
+        this.predecessor = null;
+      }
+    }
+
+    await this.refreshFingerTable().catch((refreshError) => {
+      network(`Node ${this.id} falhou ao atualizar finger table: ${refreshError.message}`);
+    });
   }
 
   closestPrecedingFinger(id) {
