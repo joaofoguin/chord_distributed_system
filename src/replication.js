@@ -31,9 +31,15 @@ class ReplicationManager {
       if (current.id === this.node.id) {
         successor = this.node.successor;
       } else {
-        const result = await this.node.rpc(current, "/rpc/successor");
-
-        successor = result.node;
+        try {
+          const result = await this.node.rpc(current, "/rpc/successor");
+          successor = result.node;
+        } catch (rpcError) {
+          // Um nó inacessível no meio da cadeia não pode travar o cálculo
+          // das réplicas nem a lista de sucessores de reserva — encerra
+          // aqui, com os nós já confirmados como vivos.
+          break;
+        }
       }
 
       if (!successor) break;

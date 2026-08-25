@@ -53,6 +53,10 @@ class ChordNode {
     this.predecessor = null;
     this.fingers = this.buildEmptyFingerTable();
     this.joined = false;
+    // Cópia dos próximos sucessores vivos no momento da última atualização do
+    // anel (join/leave). Serve de plano B quando o sucessor imediato some sem
+    // avisar a rede (ex.: computador desligado) — ver promoteNextSuccessor.
+    this.successorList = [];
 
     this.replicationManager = new ReplicationManager(
       this,
@@ -83,6 +87,7 @@ class ChordNode {
   createRing() {
     this.predecessor = this.reference;
     for (const finger of this.fingers) finger.node = this.reference;
+    this.successorList = [this.reference];
     this.joined = true;
   }
 
@@ -146,6 +151,7 @@ class ChordNode {
     await this.adoptCatalogFrom(successor);
 
     await this.refreshFingerTable();
+    await this.refreshSuccessorList();
 
     // A entrada altera também as fingers dos nós que já estavam no anel.
     await this.rpc(this.successor, "/rpc/refresh-fingers", {
@@ -282,18 +288,27 @@ class ChordNode {
 
     let current = this.reference;
 
-    while (!visited.has(current.id)) {
+    while (current && !visited.has(current.id)) {
       visited.add(current.id);
       nodes.push(current);
 
       if (current.id === this.id) {
         current = this.successor;
-      } else {
-        const result = await this.rpc(current, "/rpc/successor");
-        current = normalizeReference(result.node);
+        continue;
       }
 
-      if (!current) break;
+      try {
+        const result = await this.rpc(current, "/rpc/successor");
+        current = normalizeReference(result.node);
+      } catch (rpcError) {
+        // Um nó inacessível no meio do anel não pode travar o catálogo nem
+        // o rebalanceamento para o resto da rede — encerra o percurso aqui
+        // e segue com os nós que já foram confirmados como vivos.
+        network(
+          `Node ${current.id} inacessível ao percorrer o anel: ${rpcError.message}`,
+        );
+        break;
+      }
     }
 
     return nodes;
@@ -317,6 +332,7 @@ class ChordNode {
       throw new Error("Limite de nós excedido ao atualizar finger tables");
 
     await this.refreshFingerTable();
+    await this.refreshSuccessorList();
 
     // Cada nó responde após atualizar a própria tabela. O próximo salto ocorre
     // fora da requisição atual para o tempo total não crescer com o anel.
@@ -347,30 +363,164 @@ class ChordNode {
     if (id === this.id) return this.reference;
 
     if (inInterval(id, this.id, this.successor.id, false, true)) {
+      // Antes de responder, garante que o sucessor apontado ainda está vivo;
+      // se não estiver, promove o próximo sucessor conhecido e repara o
+      // anel, para o pedido não falhar por causa de um nó que já caiu.
+      const owner = await this.resolveLiveSuccessor();
+
       if (logLookup) {
         chord(
-          `Hash ${id} encontrado entre Node ${this.id} e Node ${this.successor.id} → sucessor Node ${this.successor.id}`,
+          `Hash ${id} encontrado entre Node ${this.id} e Node ${owner.id} → sucessor Node ${owner.id}`,
         );
       }
 
-      return this.successor;
+      return owner;
     }
 
     if (hops >= 32)
       throw new Error("Limite de saltos excedido ao procurar sucessor");
-    let next = this.closestPrecedingFinger(id);
 
-    if (logLookup) {
-      chord(`Node ${this.id} encaminhando hash ${id} para Node ${next.id}`);
+    return this.routeFindSuccessor(id, hops, logLookup);
+  }
+
+  /**
+   * Tenta encaminhar a busca pela finger table; se o nó escolhido estiver
+   * inacessível, tenta as próximas fingers e por fim o sucessor. Se o
+   * próprio sucessor estiver morto, promove um substituto conhecido
+   * (successorList) e repete — permite que a rede continue respondendo
+   * mesmo quando um ou mais nós saíram sem avisar (ex.: PC desligado).
+   */
+  async routeFindSuccessor(id, hops, logLookup) {
+    const attempted = new Set();
+    let candidate = this.closestPrecedingFinger(id);
+    if (candidate.id === this.id) candidate = this.successor;
+
+    while (candidate) {
+      if (attempted.has(candidate.id)) break;
+      attempted.add(candidate.id);
+
+      if (logLookup) {
+        chord(`Node ${this.id} encaminhando hash ${id} para Node ${candidate.id}`);
+      }
+
+      try {
+        return await this.rpc(candidate, "/rpc/find-successor", {
+          method: "POST",
+          body: { id, hops: hops + 1 },
+        });
+      } catch (rpcError) {
+        network(
+          `Node ${candidate.id} inacessível ao rotear hash ${id}: ${rpcError.message}`,
+        );
+
+        if (this.successor && candidate.id === this.successor.id) {
+          const replacement = this.promoteNextSuccessor(candidate.id);
+          candidate = replacement && !attempted.has(replacement.id) ? replacement : null;
+          continue;
+        }
+
+        if (this.successor && !attempted.has(this.successor.id)) {
+          candidate = this.successor;
+          continue;
+        }
+
+        throw rpcError;
+      }
     }
-    // Uma finger table ainda desatualizada não deve interromper a busca:
-    // caminhar pelo sucessor sempre encontra a posição correta no anel.
-    if (next.id === this.id) next = this.successor;
 
-    return this.rpc(next, "/rpc/find-successor", {
-      method: "POST",
-      body: { id, hops: hops + 1 },
+    throw new Error(`Nenhuma rota viva encontrada para localizar o sucessor do hash ${id}`);
+  }
+
+  /** Confirma que this.successor responde; senão, promove o próximo vivo. */
+  async resolveLiveSuccessor() {
+    for (let attempts = 0; attempts < this.fingers.length + 2; attempts += 1) {
+      if (this.successor.id === this.id) return this.reference;
+      if (await this.isReachable(this.successor)) return this.successor;
+
+      const replacement = this.promoteNextSuccessor(this.successor.id);
+      if (!replacement) {
+        throw new Error(
+          `Node ${this.successor.id} (sucessor) está inacessível e não há substituto conhecido`,
+        );
+      }
+    }
+    throw new Error("Limite de tentativas excedido ao substituir sucessores inacessíveis");
+  }
+
+  async isReachable(node) {
+    try {
+      await this.rpc(node, "/rpc/successor");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Remove um sucessor morto e assume o próximo nó vivo conhecido em
+   * `successorList` (calculada durante o último join/leave via
+   * ReplicationManager.getReplicaNodes). Equivale a uma "saída forçada" do
+   * nó que caiu, aplicada pelo vizinho que percebeu a falha.
+   */
+  promoteNextSuccessor(deadId) {
+    if (!this.successor || this.successor.id !== deadId) {
+      // Outra chamada concorrente já corrigiu o sucessor.
+      return this.successor && this.successor.id !== deadId ? this.successor : null;
+    }
+
+    this.successorList = this.successorList.filter((node) => node.id !== deadId);
+    const next = this.successorList.find((node) => node.id !== this.id) || null;
+
+    if (!next) {
+      this.successor = this.reference;
+      this.predecessor = this.reference;
+      error(
+        `Node ${this.id} não encontrou substituto vivo para Node ${deadId}; assumindo o anel sozinho`,
+      );
+      return this.successor;
+    }
+
+    this.successor = next;
+    chord(
+      `Node ${this.id} substituiu sucessor inacessível (Node ${deadId}) por Node ${next.id}`,
+    );
+
+    this.rpc(next, "/rpc/predecessor", {
+      method: "PUT",
+      body: { node: this.reference },
+    }).catch((notifyError) => {
+      network(
+        `Falha ao notificar Node ${next.id} sobre a saída de Node ${deadId}: ${notifyError.message}`,
+      );
     });
+    this.refreshFingerTable().catch(() => {});
+    this.refreshSuccessorList().catch(() => {});
+    setImmediate(() => {
+      this.rpc(next, "/rpc/refresh-fingers", {
+        method: "POST",
+        body: { originId: this.id, hops: 0 },
+      }).catch(() => {});
+      this.replicationManager.rebalanceAll().catch((rebalanceError) => {
+        replication(
+          `Falha ao rebalancear após remoção de Node ${deadId}: ${rebalanceError.message}`,
+        );
+      });
+    });
+
+    return this.successor;
+  }
+
+  /** Recalcula os próximos sucessores vivos, usado como plano B de rota. */
+  async refreshSuccessorList() {
+    try {
+      this.successorList = await this.replicationManager.getReplicaNodes(
+        this.reference,
+      );
+    } catch (refreshError) {
+      network(
+        `Falha ao atualizar lista de sucessores do Node ${this.id}: ${refreshError.message}`,
+      );
+    }
   }
 
   closestPrecedingFinger(id) {
@@ -435,6 +585,22 @@ class ChordNode {
     this.assertJoined();
     const name = validateFileName(fileName);
     const hashId = hashKey(name);
+
+    // O catálogo é replicado em todos os nós (ver updateCatalogOnAllNodes).
+    // Se este nó já tem uma cópia local, serve direto — evita depender do
+    // roteamento pelo anel, que pode falhar se o "owner" calculado estiver
+    // temporariamente inacessível mesmo com a rede ainda íntegra.
+    if (name === CATALOG_NAME && (await this.hasLocal(name))) {
+      const content = await this.readLocal(name);
+      return {
+        name,
+        hashId,
+        node: this.reference,
+        size: content.length,
+        content,
+      };
+    }
+
     const owner = await this.findSuccessor(hashId);
     let content;
 
