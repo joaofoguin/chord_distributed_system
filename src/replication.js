@@ -31,9 +31,15 @@ class ReplicationManager {
       if (current.id === this.node.id) {
         successor = this.node.successor;
       } else {
-        const result = await this.node.rpc(current, "/rpc/successor");
-
-        successor = result.node;
+        try {
+          const result = await this.node.rpc(current, "/rpc/successor");
+          successor = result.node;
+        } catch (rpcError) {
+          // Um nó inacessível no meio da cadeia não pode travar o cálculo
+          // das réplicas nem a lista de sucessores de reserva — encerra
+          // aqui, com os nós já confirmados como vivos.
+          break;
+        }
       }
 
       if (!successor) break;
@@ -186,8 +192,27 @@ class ReplicationManager {
     return { name, added, removed };
   }
 
-  /** Rebalanceia todos os arquivos conhecidos pelo catálogo. Chamado após entrada/saída de nós. */
+  /**
+   * Rebalanceia todos os arquivos conhecidos pelo catálogo. Chamado após
+   * entrada/saída de nós — inclusive várias vezes seguidas quando mais de
+   * um nó percebe uma falha ao mesmo tempo (ex.: um computador com vários
+   * nós caiu de uma vez). Nesse caso, as chamadas extras aproveitam a
+   * mesma execução em andamento em vez de disparar varreduras duplicadas
+   * pela rede toda, que é o que fazia a reorganização parecer travada.
+   */
   async rebalanceAll() {
+    if (this._rebalanceInFlight) {
+      replication("Rebalanceamento já em andamento; aproveitando a execução atual");
+      return this._rebalanceInFlight;
+    }
+
+    this._rebalanceInFlight = this._runRebalanceAll().finally(() => {
+      this._rebalanceInFlight = null;
+    });
+    return this._rebalanceInFlight;
+  }
+
+  async _runRebalanceAll() {
     const files = await this.node.listCatalog();
     if (files.length === 0) return [];
 
