@@ -7,8 +7,39 @@ conversa com os demais por HTTP (RPC simples em JSON) e oferece uma interface
 web para acompanhar o anel, inserir e recuperar arquivos. Requer Node.js 18+
 e não usa pacotes externos (só a biblioteca padrão do Node).
 
+## Sobre o projeto
+
+Este repositório é a implementação prática do trabalho de Sistemas
+Distribuídos: construir uma rede par-a-par (P2P) usando o protocolo Chord,
+com uma proposta de replicação de arquivos por cima do protocolo básico. A
+proposta central é simples de descrever e não tão simples de fazer
+funcionar direito: alocar um espaço fixo de posições num anel lógico,
+mapear cada nó e cada arquivo para uma posição desse anel por hash, e
+garantir que qualquer nó da rede consiga localizar (e devolver) qualquer
+arquivo — mesmo sem saber de antemão quem o guarda — usando só um punhado
+de "atalhos" (a finger table) em vez de perguntar a todo mundo.
+
+Em cima do Chord "de livro", o trabalho adiciona duas coisas que o
+protocolo básico não resolve sozinho:
+
+- **Replicação** — cada arquivo fica guardado em 5 nós (o dono + os 4
+  sucessores seguintes no anel), não só num único ponto, para sobreviver à
+  saída de qualquer um deles sem perder dados.
+- **Tolerância a falhas** — a rede se reorganiza sozinha quando um nó cai
+  sem avisar (computador desligado, processo encerrado), não só quando ele
+  sai educadamente pelo protocolo.
+
+Arquiteturalmente, o sistema é um conjunto de nós HTTP independentes que
+conversam entre si por RPC simples (JSON sobre HTTP) para formar e manter o
+anel; um painel controlador que sobe e derruba vários desses nós numa mesma
+máquina, para facilitar testes e demonstrações; e uma interface web por nó,
+para acompanhar o estado do anel e fazer upload/download de arquivos. Não
+há coordenador central, banco de dados nem dependência externa — cada nó só
+sabe o que aprende conversando com seus vizinhos.
+
 ## Sumário
 
+- [Sobre o projeto](#sobre-o-projeto)
 - [Visão geral da arquitetura](#visão-geral-da-arquitetura)
 - [Como o anel funciona (`ring.js`)](#como-o-anel-funciona-ringjs)
 - [O nó Chord (`chord-node.js`)](#o-nó-chord-chord-nodejs)
@@ -163,7 +194,7 @@ processo é fechado, o computador é desligado, a rede cai — os demais nós
 continuam com `predecessor`/`successor`/finger table apontando para um nó
 que não existe mais, e ninguém corrige isso sozinho. Encontramos esse
 problema testando o sistema com vários nós e um deles caindo de forma
-abrupta, com dois sintomas concretos:
+abrupta, com sintomas concretos:
 
 1. **Acessar `catalogo.txt` travava e devolvia HTTP 504.** Mesmo o catálogo
    já estando fisicamente salvo em todos os nós (ele é replicado 100%, não só
@@ -252,32 +283,32 @@ Duas mudanças resolveram isso:
   execução já em andamento em vez de disparar varreduras duplicadas pela
   rede quando mais de um nó percebe a falha ao mesmo tempo.
 
-Testamos assim: um "computador A" hospedando os nós 1, 6 e 12 no mesmo
-processo, e um "computador B" com os nós 18, 24 e 30. Derrubamos o processo
-inteiro do computador A de uma vez (`kill -9`, sem `/leave`) e em seguida
-fizemos 6 uploads seguidos pelo nó mais afetado (30, cujo sucessor direto
-era o nó 1, agora morto):
+Mesmo assim, restava um caso: quando **todos** os nós da `successorList`
+caíam juntos (mais nós mortos do que o fator de replicação cobre), o nó
+concluía — errado — que estava sozinho no anel, mesmo havendo outros nós
+vivos mais longe. A correção final foi consultar a **finger table** (que
+enxerga muito mais longe que a lista de reserva) antes de desistir —
+`discoverLiveSuccessorViaFingers()`. A primeira versão dessa consulta pedia
+para o nó distante resolver a busca sozinho, o que podia gerar um impasse
+(esse nó distante às vezes precisa voltar a perguntar justamente ao nó que
+está travado esperando a correção); a versão final faz uma checagem local e
+direta, sem esse risco.
 
-```
-[CHORD] Node 30 substituiu sucessor inacessível (Node 1) por Node 6
-[CHORD] Node 30 substituiu sucessor inacessível (Node 6) por Node 12
-[CHORD] Node 30 substituiu sucessor inacessível (Node 12) por Node 18
-```
+### Correção 4 — detecção contínua, sem depender de tráfego
 
-Todos os 6 uploads tiveram sucesso (HTTP 201) em menos de 45ms cada, e o
-anel dos 3 sobreviventes fechou corretamente (`18 → 24 → 30 → 18`), sem
-nenhum nó "sozinho" nem intervenção manual.
+Todas as correções acima só aconteciam quando alguma operação (`put`,
+`get`, etc.) de fato tentava rotear pelo nó morto. Se ninguém usasse a rede
+naquele momento, um nó já caído continuava aparecendo normalmente para os
+demais, inclusive na tela.
 
-### Limite que ainda existe
+- **`stabilizeTick()`**, ligado por `startStabilization()` a cada entrada
+  na rede (`createRing`/`join`) e desligado em `leave()` — roda a cada
+  poucos segundos, em segundo plano, por nó. Confirma o sucessor (curando
+  via `ensureLiveSuccessor()` se preciso), limpa o predecessor se ele parou
+  de responder, e atualiza a finger table.
 
-Esse reparo é **reativo**, não há um *heartbeat* periódico verificando a
-saúde dos vizinhos em segundo plano. A correção só acontece quando alguma
-operação (`put`, `get`, etc.) de fato tenta rotear pelo nó morto. Se nenhuma
-operação passar por ali, o ponteiro problemático fica parado até a próxima
-tentativa — o que não chega a ser um problema numa demonstração com tráfego
-constante, mas seria a próxima extensão natural do projeto (um laço
-`stabilize()`/`check_predecessor()` rodando de tempos em tempos, como no
-Chord original).
+Com isso, um nó que caiu passa a sumir da rede e da tela sozinho, mesmo sem
+nenhum upload/download acontecendo.
 
 ## Camada HTTP / RPC (`node-server.js` e `server.js`)
 
@@ -409,6 +440,9 @@ recuperação de arquivo, **(4)** exibição das réplicas.
 5. Deixe um terminal grande e visível rodando `npm start` — os logs
    `[CHORD]`, `[REPLICATION]` e `[STORAGE]` aparecem ali em tempo real e são
    sua principal evidência visual de replicação.
+6. Garanta que todas as máquinas envolvidas estão com o código mais
+   recente (`git pull origin main`) antes de subir os nós — versões
+   diferentes rodando ao mesmo tempo causam comportamento inconsistente.
 
 ### Roteiro sugerido (≈5-8 nós)
 
@@ -432,65 +466,33 @@ espaçados no anel de 1 a 32: `1, 6, 12, 18, 24, 30`.
    `http://127.0.0.1:5001`), use o formulário de upload para enviar um
    arquivo de teste. A mensagem de sucesso mostra
    `Arquivo armazenado pelo nó X (hash Y)`. No terminal do `npm start`,
-   aponte o bloco de log:
-
-   ```
-   ============================================================
-   [REPLICATION] DISTRIBUIÇÃO DE ARQUIVO
-   ============================================================
-   [REPLICATION] Arquivo: trabalho.txt
-   [REPLICATION] Owner: Node 18
-   [REPLICATION] Fator de replicação: 5
-   [REPLICATION] Nós selecionados: 18 → 24 → 30 → 1 → 6
-   [REPLICATION] Node 18 → OWNER ✓
-   [REPLICATION] Node 24 → REPLICA ✓
-   [REPLICATION] Node 30 → REPLICA ✓
-   [REPLICATION] Node 1 → REPLICA ✓
-   [REPLICATION] Node 6 → REPLICA ✓
-   [REPLICATION] Cópias confirmadas: 5/5
-   ```
-
-   Isso já mostra, em uma tela só, o dono e as 4 réplicas.
+   aponte o bloco de log que mostra o dono e as 4 réplicas sendo
+   confirmadas em tempo real.
 6. **(3) Recuperação de arquivo** — abra o painel de um nó **diferente** do
-   dono (ex.: `http://127.0.0.1:5004`, nó `24`) e baixe o mesmo arquivo pela
-   lista de catálogo. Isso prova que a rede é P2P de verdade: qualquer nó
-   localiza e entrega o arquivo, não só quem o guarda. Alternativa via
-   terminal, também eficaz ao vivo:
-
-   ```bash
-   curl -OJ 'http://127.0.0.1:5004/api/files?name=trabalho.txt'
-   ```
+   dono e baixe o mesmo arquivo pela lista de catálogo. Isso prova que a
+   rede é P2P de verdade: qualquer nó localiza e entrega o arquivo, não só
+   quem o guarda.
 7. **(4) Exibição das réplicas** — três formas de mostrar, use pelo menos
    duas:
    - **Log do terminal** (passo 5 acima) — já mostra os IDs dos nós.
    - **Sistema de arquivos**: abra `data/` e mostre que o arquivo existe
      fisicamente em `node-18-5004/`, `node-24-5005/` etc.
-     ```bash
-     ls data/node-*/trabalho.txt
-     ```
-   - **Via API**, consultando cada nó se ele guarda o arquivo:
-     ```bash
-     for p in 5001 5002 5003 5004 5005 5006; do
-       echo "porta $p:"; curl -s "http://127.0.0.1:$p/rpc/files/exists?name=trabalho.txt"
-     done
-     ```
-8. **Bônus — saída graciosa / rebalanceamento** (mostra domínio do tema, não
-   é obrigatório mas impressiona): remova um nó que guarda uma réplica
-   (botão "Remover" no painel, ou `DELETE /api/nodes/<porta>`) e mostre no
-   terminal o log `[REPLICATION] REBALANCEAMENTO DO FATOR DE REPLICAÇÃO`,
-   provando que a rede recompõe as 5 cópias automaticamente entre os nós
-   restantes. Confirme rodando de novo o `for` do passo 7 — ainda existem 5
-   cópias, agora em nós diferentes.
+   - **Via API**, consultando cada nó se ele guarda o arquivo
+     (`GET /rpc/files/exists?name=...`).
+8. **Bônus — saída graciosa / rebalanceamento**: remova um nó que guarda
+   uma réplica (botão "Remover" no painel, ou `DELETE /api/nodes/<porta>`)
+   e mostre no terminal o log de rebalanceamento, provando que a rede
+   recompõe as 5 cópias automaticamente entre os nós restantes.
 9. **Bônus avançado — falha abrupta de um nó** (ver
    [Tolerância a falhas e recuperação do anel](#tolerância-a-falhas-e-recuperação-do-anel)):
    diferente do passo 8 (saída avisada, via `/leave`), aqui um nó
    simplesmente some sem avisar ninguém — o cenário real de "o computador de
    alguém do grupo desligou". Se a demo for em várias máquinas, é só fechar
-   o terminal de uma delas no meio da apresentação; o log das outras vai
-   mostrar `[CHORD] Node X substituiu sucessor inacessível (Node Y) por
-   Node Z` e o upload/download seguinte continua funcionando normalmente.
-   Se a demo for numa máquina só, isso não dá pra simular derrubando um nó
-   pelo painel — todos os nós locais rodam dentro do mesmo processo do
+   o terminal de uma delas no meio da apresentação; em poucos segundos os
+   demais percebem sozinhos (mesmo sem nenhum upload/download acontecendo)
+   e o upload/download seguinte continua funcionando normalmente. Se a demo
+   for numa máquina só, isso não dá pra simular derrubando um nó pelo
+   painel — todos os nós locais rodam dentro do mesmo processo do
    `npm start`, então matar o processo derruba todos de uma vez. **Ensaie
    esse passo com antecedência** para decidir se ele entra na apresentação.
 
